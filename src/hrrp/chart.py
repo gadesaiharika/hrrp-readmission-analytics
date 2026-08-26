@@ -22,12 +22,6 @@ from . import db  # noqa: E402
 
 OUT = Path(__file__).resolve().parents[2] / "docs" / "readmission_by_cohort.png"
 
-LABELS = {
-    "HF": "Heart failure", "COPD": "COPD", "PNEUMONIA": "Pneumonia",
-    "AMI": "Acute MI", "CABG": "CABG", "THA_TKA": "Hip / knee replacement",
-    "OTHER": "All other inpatient",
-}
-
 INK = "#1b2430"
 ABOVE = "#c0392b"     # worse than the national benchmark
 BELOW = "#2e7d5b"     # better than the national benchmark
@@ -35,12 +29,14 @@ MARK = "#5b6670"
 
 
 def render(conn, out_path: Path = OUT):
+    # cohort_label and the benchmark both come from DimHrrpCohort, so this chart
+    # cannot drift from what the views and the dashboard report.
     _, rows = db.query(conn, """
-        SELECT hrrp_condition, index_admissions, rate_pct, national_rate_pct
+        SELECT cohort_label, index_admissions, rate_pct, national_rate_pct
         FROM vw_hrrp_cohort_summary
         ORDER BY rate_pct ASC NULLS FIRST""")
 
-    names = [LABELS.get(r[0], r[0]) for r in rows]
+    names = [r[0] for r in rows]
     counts = [r[1] for r in rows]
     rates = [float(r[2] or 0) for r in rows]
     natl = [float(r[3] or 0) for r in rows]
