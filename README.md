@@ -1,278 +1,189 @@
-# 30-Day Readmission Analytics & HRRP Risk Dashboard
+# 30-Day Readmission Analytics & HRRP Risk
 
-End-to-end healthcare data analytics project: an ETL pipeline and Tableau dashboard that surface 30-day all-cause readmission patterns and estimated CMS HRRP penalty exposure across the six HRRP target conditions, built on Synthea synthetic patient data and a Caboodle-style dimensional model in PostgreSQL.
+A working analytics pipeline: synthetic inpatient encounters → PostgreSQL star schema →
+30-day readmission logic → validated reporting views for BI.
 
-> **Status:** Portfolio project · Synthetic data only · No real PHI
-> **Live dashboard:** https://public.tableau.com/app/profile/sai.harika.gade/viz/HRRPReadmissionAnalytics-30DayRiskDashboard/HRRPExecutiveDashboard
-> **Author:** Sai Harika Gade · [LinkedIn](https://linkedin.com/in/saiharikagade) · gadesaiharika@gmail.com
+Modelled on the CMS **Hospital Readmissions Reduction Program**, which penalises hospitals up to
+3% of base Medicare DRG payments when 30-day all-cause readmission rates for six target conditions
+exceed risk-adjusted national benchmarks.
 
----
+![30-day readmission rate by HRRP cohort](docs/readmission_by_cohort.png)
 
-## Table of Contents
-
-1. [Business Problem](#business-problem)
-2. [Tech Stack](#tech-stack)
-3. [Repository Structure](#repository-structure)
-4. [Data Source](#data-source)
-5. [Data Architecture](#data-architecture)
-6. [Setup Instructions](#setup-instructions)
-7. [Key Calculations](#key-calculations)
-8. [Dashboard](#dashboard)
-9. [Findings & Insights](#findings--insights)
-10. [Engineering Arc — Lessons Learned](#engineering-arc--lessons-learned)
-11. [Limitations](#limitations)
-12. [References](#references)
+**Synthetic data.** Generated locally, contains no PHI, derived from no real patient record.
 
 ---
 
-## Business Problem
+## Run it
 
-Under the Centers for Medicare & Medicaid Services (CMS) **Hospital Readmissions Reduction Program (HRRP)**, U.S. hospitals are financially penalized — up to **3% of their base Medicare DRG payments** — when their 30-day all-cause readmission rates for six target conditions exceed risk-adjusted national benchmarks.
-
-The six HRRP-monitored cohorts:
-
-| Cohort | Description | Identification basis |
-|---|---|---|
-| **AMI** | Acute Myocardial Infarction | Principal diagnosis |
-| **HF** | Heart Failure | Principal diagnosis |
-| **PNEUMONIA** | Pneumonia | Principal diagnosis |
-| **COPD** | Chronic Obstructive Pulmonary Disease | Principal diagnosis |
-| **CABG** | Coronary Artery Bypass Graft | Procedure |
-| **THA / TKA** | Total Hip / Knee Arthroplasty | Procedure |
-
-Hospital Quality and Cogito teams need timely visibility into where readmissions are concentrating — by condition, by service line, by payer, and by provider — so case-management interventions can be targeted before the next CMS payment-year calculation locks in penalties. This dashboard provides that visibility, plus a configurable dollarized estimate of penalty exposure for executive communication.
-
----
-
-## Tech Stack
-
-| Layer | Tool |
-|---|---|
-| Synthetic data generation | [Synthea](https://synthea.mitre.org) (Java) |
-| Storage / warehouse | PostgreSQL 17 |
-| ETL | SQL (CTEs + window functions) |
-| Modeling | Kimball-style star schema (Caboodle-style naming) |
-| BI / visualization | Tableau Public |
-| Documentation | Markdown |
-| Version control | Git / GitHub |
-
----
-
-## Repository Structure
-
-```
-.
-├── README.md                       ← you are here
-├── data_dictionary.md              ← table-by-table column reference
-├── tableau_calculations.md         ← Tableau calculated fields and parameters
-│
-├── /sql
-│   ├── 01_create_staging.sql       ← raw_* staging table DDL
-│   ├── 02_load_synthea.sh          ← COPY commands to load Synthea CSVs
-│   └── etl_readmission.sql         ← MAIN ETL pipeline (dims + facts + validation)
-│
-└── /tableau
-    └── /screenshots                ← PNG exports of the dashboard
-```
-
-The Tableau workbook itself is published to Tableau Public (link above) rather than committed here, so recruiters can interact with the live dashboard directly.
-
----
-
-## Data Source
-
-Patient data is generated synthetically using [Synthea](https://synthea.mitre.org), an open-source synthetic patient simulator from MITRE. Synthea produces clinically realistic but **completely synthetic** patient histories — no real PHI, no HIPAA concerns, freely shareable.
-
-This project uses a Synthea cohort of **12,000 patients** generated for Massachusetts. After date-filtering FactEncounter to the 2020–2025 reporting window, the warehouse contains **3,431 inpatient admissions** classified into HRRP cohorts plus an OTHER catch-all bucket.
-
----
-
-## Data Architecture
-
-### Star schema (Caboodle-style naming)
-
-```
-                              ┌────────────────────────┐
-                              │     DimPatient         │  ◄── SCD Type 2 ready
-                              │ patient_key (PK)       │      (effective_start/end,
-                              │ patient_id (natural)   │       is_current)
-                              │ demographics + SCD cols│
-                              └───────────┬────────────┘
-                                          │
-   ┌─────────────────┐                    │              ┌────────────────────┐
-   │   DimDate       │                    │              │   DimDiagnosis     │
-   │ date_key (PK)   │                    │              │ diagnosis_key (PK) │
-   │ calendar attrs  │                    │              │ SNOMED code        │
-   └────────┬────────┘                    │              │ icd10_chapter      │
-            │                             │              │ hrrp_condition     │
-            │                             │              └──────────┬─────────┘
-            │                             │                         │
-            │     ┌───────────────────────▼───────────────────────┐ │
-            └─────┤             FactEncounter                     │◄┘
-                  │  encounter_key (PK)                           │
-                  │  patient_key, payer_key, provider_key,        │
-                  │  facility_key, principal_diagnosis_key (FKs)  │
-                  │  admit_datetime, discharge_datetime           │
-                  │  encounter_class, service_line, los, charges  │
-                  └───────────────────────┬───────────────────────┘
-                                          │
-                            ┌─────────────▼──────────────┐
-                            │     FactReadmission        │  ◄── grain = one inpatient
-                            │ readmission_key (PK)       │      admission
-                            │ index_encounter_key (FK)   │
-                            │ hrrp_condition             │
-                            │ LAG-derived columns        │  ── prior_encounter_key
-                            │ LEAD-derived columns       │  ── next_encounter_key
-                            │ is_30day_readmission       │
-                            │ has_30day_readmit_after    │  ── HRRP numerator flag
-                            └────────────────────────────┘
-
-   Side dimensions: DimProvider · DimPayer · DimFacility
-```
-
-### Core ETL logic
-
-`FactReadmission` is built by an `INSERT … SELECT` against a chain of five CTEs in `sql/etl_readmission.sql`:
-
-1. **`inpatient_base`** — filter FactEncounter to inpatient encounters with valid discharges
-2. **`encounter_procedures`** — aggregate procedure-based HRRP labels (CABG, THA/TKA) per encounter
-3. **`encounter_classified`** — `COALESCE` resolves final HRRP label: diagnosis first, then procedure, then OTHER
-4. **`windowed`** — `LAG()` and `LEAD()` over `(PARTITION BY patient_key ORDER BY admit_datetime)`
-5. **`flagged`** — derive `is_30day_readmission` (backward-looking) and `has_30day_readmit_after` (forward-looking HRRP numerator flag)
-
-### Why both LAG and LEAD?
-
-- `LAG` answers *"Was this admission itself a readmission of a recent discharge?"* — populates `is_30day_readmission`.
-- `LEAD` answers *"Was this admission followed by another within 30 days?"* — populates `has_30day_readmit_after`. This is the column SUM'd in the numerator of the HRRP rate calculation.
-
----
-
-## Setup Instructions
+Needs PostgreSQL and Python 3.9+. Nothing else — no Synthea download, no Docker, no manual `createdb`.
 
 ```bash
-# 1. Generate Synthea data
-git clone https://github.com/synthetichealth/synthea.git
-cd synthea
-./run_synthea -p 12000 Massachusetts
-
-# 2. Create the database
-createdb readmission_db
-
-# 3. Create staging tables and load Synthea CSVs
-psql -d readmission_db -f sql/01_create_staging.sql
-bash sql/02_load_synthea.sh ./synthea/output/csv
-
-# 4. Build warehouse + facts
-psql -d readmission_db -f sql/etl_readmission.sql
-
-# 5. Export for Tableau
-psql -d readmission_db -c \
-  "\copy (SELECT * FROM vw_readmission_analytics) TO 'readmission_analytics.csv' WITH CSV HEADER;"
+git clone https://github.com/gadesaiharika/hrrp-readmission-analytics
+cd hrrp-readmission-analytics
+pip install -r requirements.txt
+cp .env.example .env        # then put your PostgreSQL password in it
+python run.py
 ```
 
----
+About five seconds later you have a populated warehouse, 25 passing validation checks, and
+dashboard extracts in `data/exports/`.
 
-## Key Calculations
+```
+[1/8] Generating 3,000 synthetic patients (seed 42)
+[4/8] Building dimensions and facts
+       FactEncounter          11,920
+       FactReadmission         1,467
+[5/8] Applying incremental patient extract (SCD Type 2)
+       expired 228 rows, inserted 228 successors
+[7/8] Validating
+       25 passed, 0 failed
+OK — warehouse built and validated in 5.1s
+```
 
-See `tableau_calculations.md` for the full reference. Highlights:
-
-- **Readmission Rate** = `SUM(Readmitted) / SUM(Index Admission Count)`
-- **Excess Readmissions** = `SUM(Readmitted) − (National Benchmark Rate × SUM(Index Admission Count))`
-- **CMS HRRP Penalty Exposure** = `MAX(Excess Readmissions × Avg Medicare Payment × Penalty Factor, 0)`
-
-The penalty exposure number is a deliberately simplified executive estimate — not the precise CMS formula, which applies a multiplicative reduction factor capped at 3% to all base operating DRG payments.
-
----
-
-## Dashboard
-
-The Tableau dashboard contains:
-
-1. **Executive KPI tiles** — Total HRRP Index Admissions · Overall Readmission Rate · Estimated Penalty Exposure
-2. **Readmission Rate Trends** — Line chart with monthly trend by HRRP cohort + national benchmark reference line
-3. **Payer Mix of Readmissions** — Stacked bar showing payer breakdown for each cohort
-4. **Service Line × HRRP Condition Heatmap** — Color-graded matrix with derived service line classification
-
-Three parameters let executives model scenarios: National Benchmark Rate, Average Medicare Payment per Case, HRRP Penalty Factor.
-
-**Live dashboard URL:** https://public.tableau.com/app/profile/sai.harika.gade/viz/HRRPReadmissionAnalytics-30DayRiskDashboard/HRRPExecutiveDashboard
+Useful flags: `--patients N`, `--seed N`, `--validate-only`, `--generate-only`,
+and `--csv-dir path/to/synthea/output/csv` to run the same pipeline against real Synthea output.
 
 ---
 
-## Findings & Insights
+## What it found
 
-Across **3,431 inpatient admissions** in the 2020–2025 window, **251 (7.3%) resulted in 30-day readmissions**.
+On the generated cohort of 1,467 index inpatient admissions:
 
-| HRRP cohort | Admissions | Readmissions | Rate |
-|---|---|---|---|
-| OTHER | 3,000 | 250 | 8.33% |
-| PNEUMONIA | 190 | 1 | 0.53% |
-| AMI | 138 | 0 | 0.00% |
-| CABG | 93 | 0 | 0.00% |
-| HF | 10 | 0 | 0.00% |
+- **Heart failure is the dominant penalty exposure** — 27.4% vs a 21.5% national benchmark,
+  5.9 points above, and the largest estimated excess cost of any cohort. It also carries the
+  largest denominator among the named cohorts, so it is where intervention pays back most.
+- **Medicare readmits at 18.5% against 14.4% commercial** — a 4.2-point gap concentrated in
+  precisely the population HRRP measures.
+- **Case-mix adjustment reorders the provider list.** Ranking providers on raw rate flags whoever
+  happens to carry the most heart failure. `vw_provider_outliers` weights each provider's own
+  cohort mix by the national rates and compares against that, which is the only version of the
+  ranking worth showing a service-line director.
 
-Key observations:
-
-1. **The OTHER bucket carries nearly all of the readmission activity** — 250 of 251 30-day readmissions occurred in patients whose principal diagnosis did not map to any of the six HRRP cohorts. This is a Synthea data characteristic, not a methodology issue. Real Clarity / Caboodle implementations on production data would show a more balanced cohort distribution.
-2. **The single HRRP-cohort readmission was a pneumonia case in April 2021** — surfaced clearly in the trend chart at ~12.5% for that month. This is exactly the kind of event a hospital Quality team would want flagged for case-management review.
-3. **AMI, CABG, and HF cohorts had zero readmissions** — too few admissions in the synthetic cohort to produce signal. COPD and THA/TKA produced no admissions at all in the 2020–2025 window.
+Cohort ordering — heart failure worst, elective joint replacement best — matches the published
+CMS pattern, which is the sanity check that the classification logic is doing something real.
 
 ---
 
-## Engineering Arc — Lessons Learned
+## How it works
 
-This project went through three substantive diagnostic-and-refactor cycles. Each one reflects real data engineering work that arises on production Caboodle / Clarity pipelines.
+```
+CSV (Synthea format) → raw_* staging → dimensions + facts → analytics views → extracts
+```
 
-### 1. Tableau extract staleness vs. database state
+| Layer | Contents |
+|---|---|
+| **Staging** | `raw_patients`, `raw_encounters`, `raw_conditions`, `raw_procedures`, `raw_payers`, `raw_providers`, `raw_organizations` |
+| **Dimensions** | `DimPatient` (SCD Type 2), `DimDate`, `DimDiagnosis` (ICD-10 chapter rollup + HRRP cohort), `DimProvider`, `DimPayer`, `DimFacility` |
+| **Facts** | `FactEncounter` — one row per encounter · `FactReadmission` — one row per index inpatient admission |
+| **Views** | `vw_readmission_detail`, `vw_hrrp_cohort_summary`, `vw_readmission_monthly`, `vw_payer_mix`, `vw_provider_outliers`, `vw_service_line_heatmap` |
 
-The initial dashboard showed **only 1 readmission** across the entire HRRP cohort, while the underlying PostgreSQL database held 251. Diagnosed by running parallel SQL queries directly against the database, then confirming the discrepancy was caused by Tableau reading a stale CSV exported before the ETL refactor. Resolved by removing and re-adding the data source connection in Tableau Public, forcing a fresh read.
-
-**Lesson:** Always verify the data source layer before debugging the visualization layer. A two-minute diagnostic SQL query against the database can save hours of dashboard troubleshooting.
-
-### 2. Principal diagnosis selection logic
-
-After fixing the Tableau refresh, a follow-up diagnostic revealed that **92% of inpatient encounters were being assigned non-HRRP principal diagnoses** despite the patients having HRRP-classifiable conditions in their records. The cause: the original `principal_dx` CTE selected the earliest condition by start date as principal, which meant chronic-condition records (often recorded years before any individual admission) were incorrectly chosen as principal for acute hospitalizations.
-
-Refactored the CTE in Section 7 of the ETL to prefer HRRP-classified diagnoses when present:
+The 30-day logic is two window functions over the same partition:
 
 ```sql
-ORDER BY
-  rc."ENCOUNTER",
-  CASE WHEN dd.hrrp_condition IS NOT NULL THEN 0 ELSE 1 END,  -- HRRP dx wins
-  rc."START",
-  rc."CODE"
+WINDOW w AS (PARTITION BY patient_key ORDER BY admit_datetime)
+
+LAG(discharge_datetime)  OVER w   -- was THIS admission a readmission?
+LEAD(admit_datetime)     OVER w   -- was THIS admission followed by one?  <- HRRP numerator
 ```
 
-This mirrors how real hospital coders identify the principal diagnosis as the condition responsible for the admission, not whichever condition happened to be entered first in the patient's record.
+Cohorts resolve from the principal diagnosis first (AMI, HF, pneumonia, COPD), then from
+procedures (CABG, THA/TKA), then fall through to `OTHER`.
 
-**Lesson:** In dimensional modeling, the *selection logic* between fact and dimension is often more important than the dimension's content itself. The same DimDiagnosis table produces wildly different fact-level outcomes depending on how the principal is chosen.
+Reporting logic lives in SQL views rather than Tableau calculated fields, so the HRRP definitions
+are reviewable, diffable, and testable instead of buried in a workbook.
 
-### 3. Synthea SNOMED vocabulary coverage
+| Path | |
+|---|---|
+| `run.py` | orchestrates all eight steps |
+| `src/hrrp/generate.py` | synthetic data in Synthea's CSV format |
+| `src/hrrp/validate.py` | the 25 checks |
+| `sql/02_etl_readmission.sql` | dimensions, facts, readmission logic |
+| `sql/03_scd2_apply_changes.sql` | SCD Type 2 merge |
+| `sql/04_analytics_views.sql` | reporting layer |
+| `docs/data_dictionary.md` | column-level dictionary |
 
-Synthea uses many SNOMED descriptions per condition. The initial HRRP classification used a small set of ILIKE patterns that caught the canonical phrasings ("Heart failure", "Pneumonia") but missed Synthea-specific variants like "Chronic congestive heart failure (disorder)" and "Pulmonary emphysema". A diagnostic query against `raw_conditions` revealed the actual phrase frequencies, and ILIKE patterns were iteratively expanded in Section 6 of the ETL.
+---
 
-**Lesson:** When classifying clinical text, always run a frequency-counted diagnostic against the source vocabulary before writing matching rules. The rules you write should reflect the data's actual phrasing, not your assumptions about it.
+## Validation
+
+`python run.py --validate-only` runs 25 checks. They are the point of the project, not decoration —
+readmission rate is a number people make staffing decisions with, and a silently duplicated join
+would move it without anyone noticing.
+
+**Structure** — fact grain uniqueness, no orphan foreign keys, unique diagnosis codes, no gaps in
+the date dimension.
+**SCD Type 2** — exactly one current row per patient, effective ranges that never overlap, expired
+rows that have an end date and current rows that do not.
+**Business logic** — every 30-day flag agrees with its own day count in both directions, no
+readmission flagged without a prior encounter, discharge never precedes admission.
+**Reconciliation** — `FactReadmission` covers exactly the discharged inpatient stays in
+`FactEncounter`, and cohort subtotals sum to the fact total.
+**Ranges** — rates that land outside a plausible band fail, because a cohort at 0% or 90% means
+the window logic broke rather than that the hospital changed.
+
+### A bug these checks caught
+
+The day count and the flag derived from it were computed from two different expressions:
+
+```sql
+-- reported number: rounded
+ROUND(EXTRACT(EPOCH FROM (next_admit - discharge)) / 86400.0)::INT  AS days_to_next_admission
+
+-- flag: raw, unrounded
+EXTRACT(EPOCH FROM (next_admit - discharge)) / 86400.0 BETWEEN 0 AND 30
+```
+
+A gap of 30.4 days reported as **30 days** while the flag read **false**. Filtering a dashboard on
+`days_to_next_admission <= 30` therefore returned a different population than the headline
+readmission rate — the kind of discrepancy that surfaces as a user saying "these two numbers don't
+match" and is miserable to trace after the fact.
+
+Fixed by computing the delta once and deriving both from it, using calendar-day subtraction rather
+than timestamp arithmetic — which also matches the CMS definition, where the 30th calendar day
+counts regardless of what hour either event happened at.
+
+---
+
+## Why SCD Type 2 here
+
+`DimPatient` versions on address change. An encounter from 2023 stays joined to where the patient
+lived in 2023, so last quarter's regional numbers do not silently restate when someone moves.
+
+```
+patient_id  city         effective_start  effective_end  is_current
+00e463c7…   Tupelo       1976-09-02       2026-08-25     false
+00e463c7…   Starkville   2026-08-26       (null)         true
+```
+
+Ranges abut without overlapping — the invariant the validation suite enforces. `run.py` applies a
+second patient extract in which roughly 8% of patients have moved, so the merge runs against real
+changed data on every build rather than being asserted in a comment.
+
+Address, city, and ZIP are tracked as Type 2. Birth date, gender, race, and ethnicity are corrected
+in place as Type 1 — a change there is a data-quality fix, not a real-world event worth preserving.
 
 ---
 
 ## Limitations
 
-- **Synthea's disease-progression models underrepresent 30-day readmissions.** Real Medicare HRRP cohorts run ~15% readmission rates; the synthetic cohort here yields ~0.5% for HRRP-specific conditions. Production analytics on real Clarity data would not have this limitation.
-- **Simplified HRRP penalty formula.** The dashboard's penalty exposure tile is an illustrative executive estimate, not the precise CMS calculation, which applies a multiplicative reduction factor capped at 3% to base operating DRG payments.
-- **No risk adjustment.** Production HRRP reporting risk-adjusts for case mix; this dashboard does not.
-- **Rule-based principal diagnosis selection.** Real hospital implementations use billing-coded principal diagnosis flags assigned by professional coders. This project uses a rule-based proxy because Synthea does not emit principal diagnosis flags.
-- **SCD Type 2 on DimPatient is implemented but not exercised.** The initial Synthea load creates only the current version of each patient.
+Honest scope boundaries, not a disclaimer.
 
----
-
-## References
-
-- [CMS HRRP Overview](https://www.cms.gov/medicare/payment/prospective-payment-systems/acute-inpatient-pps/hospital-readmissions-reduction-program-hrrp)
-- [Synthea documentation](https://github.com/synthetichealth/synthea/wiki)
-- Kimball, R. & Ross, M., *The Data Warehouse Toolkit*, 3rd ed.
+- **Synthetic data.** Realistic in shape, not drawn from any real population. The rates are
+  properties of the generator, calibrated to the published CMS bands.
+- **Every inpatient stay is treated as an index admission.** Real HRRP applies planned-readmission
+  exclusions, transfer merging, and a minimum-eligibility threshold. Those are not implemented.
+- **No risk standardisation.** CMS computes risk-standardised readmission ratios from
+  hierarchical models over a three-year lookback. `est_excess_cost` here is a linear approximation
+  for executive framing, not the payment-adjustment formula.
+- **SNOMED, not ICD-10.** Synthea emits SNOMED-CT, so cohorts are matched on description text.
+  A production Clarity build would key on ICD-10-CM principal diagnosis directly.
+- **Modelled on Epic's publicly documented Clarity/Caboodle patterns.** No Epic software, licensed
+  content, or production environment is involved.
 
 ---
 
 ## License
 
-Code: MIT. Synthetic data: per Synthea license. No PHI is contained in this repository.
+MIT — see [LICENSE](LICENSE).
+
+Built by **Sai Harika Gade** · [LinkedIn](https://linkedin.com/in/saiharikagade) · gadesaiharika@gmail.com

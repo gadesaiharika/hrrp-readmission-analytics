@@ -451,34 +451,42 @@ windowed AS (
   WINDOW w AS (PARTITION BY ec.patient_key ORDER BY ec.admit_datetime)
 ),
 
--- CTE 5: Derive readmission flags from the windowed deltas
-flagged AS (
+-- CTE 5: Day deltas, computed ONCE.
+--
+-- These were previously derived twice: the reported day count used
+-- ROUND(epoch/86400) while the flag compared the raw unrounded fraction to 30.
+-- A gap of 30.4 days therefore reported as "30 days" while the flag read FALSE,
+-- so filtering the dashboard on days_to_next_admission <= 30 returned a
+-- different population than the headline readmission rate. Caught by
+-- src/hrrp/validate.py ("a gap of 0-30 days is never left unflagged").
+--
+-- Now both the number and the flag come from the same column, so they cannot
+-- disagree. Using date subtraction rather than timestamp arithmetic also makes
+-- the window a calendar-day count, which is the CMS definition: a readmission
+-- "within 30 days of discharge" means the 30th calendar day counts, regardless
+-- of the hour of day either event happened to occur.
+deltas AS (
   SELECT
     w.*,
-    -- Days since prior discharge (NULL if no prior inpatient stay)
-    CASE
-      WHEN w.prior_discharge_datetime IS NULL THEN NULL
-      ELSE ROUND( EXTRACT(EPOCH FROM (w.admit_datetime - w.prior_discharge_datetime)) / 86400.0 )::INT
-    END AS days_since_prior_discharge,
-    -- Days to next admission (NULL if no subsequent inpatient stay)
-    CASE
-      WHEN w.next_admit_datetime IS NULL THEN NULL
-      ELSE ROUND( EXTRACT(EPOCH FROM (w.next_admit_datetime - w.discharge_datetime)) / 86400.0 )::INT
-    END AS days_to_next_admission,
-    -- Flag: is THIS admission a readmission of a prior discharge within 30 days?
-    CASE
-      WHEN w.prior_discharge_datetime IS NOT NULL
-       AND EXTRACT(EPOCH FROM (w.admit_datetime - w.prior_discharge_datetime)) / 86400.0 BETWEEN 0 AND 30
-      THEN TRUE ELSE FALSE
-    END AS is_30day_readmission,
-    -- Flag: was THIS admission followed by another inpatient admission within 30 days?
-    -- This is the HRRP NUMERATOR flag for index admissions.
-    CASE
-      WHEN w.next_admit_datetime IS NOT NULL
-       AND EXTRACT(EPOCH FROM (w.next_admit_datetime - w.discharge_datetime)) / 86400.0 BETWEEN 0 AND 30
-      THEN TRUE ELSE FALSE
-    END AS has_30day_readmit_after
+    -- Whole calendar days from prior discharge to this admission.
+    (w.admit_datetime::DATE - w.prior_discharge_datetime::DATE) AS days_since_prior_discharge,
+    -- Whole calendar days from this discharge to the next admission.
+    (w.next_admit_datetime::DATE - w.discharge_datetime::DATE)  AS days_to_next_admission
   FROM windowed w
+),
+
+-- CTE 6: Flags derived from those same deltas — single source of truth.
+flagged AS (
+  SELECT
+    d.*,
+    -- Is THIS admission a readmission of a prior discharge within 30 days?
+    (d.days_since_prior_discharge IS NOT NULL
+     AND d.days_since_prior_discharge BETWEEN 0 AND 30) AS is_30day_readmission,
+    -- Was THIS admission followed by another inpatient admission within 30 days?
+    -- This is the HRRP NUMERATOR flag for index admissions.
+    (d.days_to_next_admission IS NOT NULL
+     AND d.days_to_next_admission BETWEEN 0 AND 30)     AS has_30day_readmit_after
+  FROM deltas d
 )
 SELECT
   encounter_key,                            -- index_encounter_key

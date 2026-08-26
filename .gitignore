@@ -1,0 +1,20 @@
+# Generated data — reproducible from `python run.py`, so not tracked.
+data/csv/
+data/exports/
+*.hyper
+*.twbx
+
+# Local credentials
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
