@@ -9,6 +9,8 @@ exceed risk-adjusted national benchmarks.
 
 ![30-day readmission rate by HRRP cohort](docs/readmission_by_cohort.png)
 
+**Interactive dashboard:** [HRRP Readmission Dashboard on Tableau Public](https://public.tableau.com/app/profile/sai.harika.gade/viz/HRRPReadmissionDashboard/Dashboard2)
+
 **Synthetic data.** Generated locally, contains no PHI, derived from no real patient record.
 
 ---
