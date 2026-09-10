@@ -128,8 +128,23 @@ VIOLATION_CHECKS = [
      """SELECT readmission_key FROM FactReadmission
         WHERE is_30day_readmission AND prior_encounter_key IS NULL"""),
 
-    ("HRRP cohort is always populated",
-     "SELECT readmission_key FROM FactReadmission WHERE hrrp_condition IS NULL"),
+    # Replaces "HRRP cohort is always populated", which could never fail:
+    # hrrp_condition is NOT NULL and the ETL COALESCEs to 'OTHER', so the query
+    # had no way to return a row. Meanwhile the range check on cohort share
+    # passed at 55.7% while half of COPD was being dropped into OTHER - a range
+    # check cannot see a classifier that fails on some wordings of a condition.
+    ("HRRP classification: no admission naming a target condition falls through to OTHER",
+     """SELECT r.readmission_key FROM FactReadmission r
+        JOIN FactEncounter e ON e.encounter_key = r.index_encounter_key
+        JOIN DimDiagnosis dd ON dd.diagnosis_key = e.principal_diagnosis_key
+        WHERE r.hrrp_condition = 'OTHER'
+          AND (dd.description ILIKE '%obstructive%'
+            OR dd.description ILIKE '%emphysema%'
+            OR dd.description ILIKE '%chronic%bronchitis%'
+            OR dd.description ILIKE '%heart failure%'
+            OR dd.description ILIKE '%cardiac failure%'
+            OR dd.description ILIKE '%myocardial infarction%'
+            OR dd.description ILIKE '%pneumonia%')"""),
 ]
 
 

@@ -52,6 +52,9 @@ On the generated cohort of 1,467 index inpatient admissions:
 - **Heart failure is the dominant penalty exposure** — 27.4% vs a 21.5% national benchmark,
   5.9 points above, and the largest estimated excess cost of any cohort. It also carries the
   largest denominator among the named cohorts, so it is where intervention pays back most.
+- **COPD is the second exposure, and it was hiding** — 25.0% on 176 admissions against a 19.6%
+  benchmark, 5.4 points above. An earlier build reported it at 16.9% and *below* benchmark,
+  because the classifier was missing half its admissions. See "A bug the checks missed" below.
 - **Medicare readmits at 18.5% against 14.4% commercial** — a 4.2-point gap concentrated in
   precisely the population HRRP measures.
 - **Case-mix adjustment reorders the provider list.** Ranking providers on raw rate flags whoever
@@ -60,7 +63,8 @@ On the generated cohort of 1,467 index inpatient admissions:
   ranking worth showing a service-line director.
 
 Cohort ordering — heart failure worst, elective joint replacement best — matches the published
-CMS pattern, which is the sanity check that the classification logic is doing something real.
+CMS pattern. That is a sanity check, not proof: the ordering held even while half of COPD was
+misclassified.
 
 ---
 
@@ -141,6 +145,23 @@ match" and is miserable to trace after the fact.
 Fixed by computing the delta once and deriving both from it, using calendar-day subtraction rather
 than timestamp arithmetic — which also matches the CMS definition, where the 30th calendar day
 counts regardless of what hour either event happened at.
+
+### A bug the checks missed
+
+All 25 checks passed while half of COPD was being filed as "All other inpatient." The classifier
+matched `'%chronic bronchitis%'`; the diagnosis text was "Chronic obstructive bronchitis," and the
+word *obstructive* in the middle broke the match. COPD reported 89 admissions at 16.9%, below its
+benchmark, when the true figure was 176 at 25.0%, above it.
+
+It surfaced on the Tableau heatmap: 87 "All other" admissions sitting in Pulmonology at 33.3%, a
+combination the data should not produce. The checks had two blind spots. A range check on cohort
+share passed at 55.7%, because a classifier that fails on *some wordings* of a condition still lands
+in a plausible band. And "HRRP cohort is always populated" could never fail at all — the column is
+`NOT NULL` and the ETL defaults to `OTHER`.
+
+That dead check is replaced with one that fails if any admission whose diagnosis names a target
+condition falls through to `OTHER`. It fails with exactly 87 rows against the old build and passes
+against the fixed one, which is the evidence that it tests the right thing.
 
 ---
 

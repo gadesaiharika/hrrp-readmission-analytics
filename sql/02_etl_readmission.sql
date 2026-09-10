@@ -254,10 +254,16 @@ WHERE description ILIKE '%heart failure%'
 UPDATE DimDiagnosis SET hrrp_condition = 'PNEUMONIA'
 WHERE description ILIKE '%pneumonia%';
 
+-- '%chronic%bronchitis%', not '%chronic bronchitis%'. The contiguous form missed
+-- "Chronic obstructive bronchitis" (SNOMED 185086009) because "obstructive" sits
+-- between the two words, so half of all COPD admissions fell through to OTHER.
+-- COPD reported 89 admissions at 16.9% - below the 19.6% benchmark - when the
+-- true figure was 176 at 25.0%, above it. A substring match on clinical text is
+-- only as good as its tolerance for the words clinicians put in the middle.
 UPDATE DimDiagnosis SET hrrp_condition = 'COPD'
 WHERE description ILIKE '%chronic obstructive pulmonary%'
    OR description ILIKE '%emphysema%'
-   OR description ILIKE '%chronic bronchitis%';
+   OR description ILIKE '%chronic%bronchitis%';
 
 UPDATE DimDiagnosis SET hrrp_condition = 'CABG'
 WHERE description ILIKE '%coronary artery bypass%'
